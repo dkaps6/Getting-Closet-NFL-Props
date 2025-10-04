@@ -1,7 +1,7 @@
-# Safe, binary-compatible pin set for Actions ubuntu-latest + Python 3.11
-numpy==1.26.4
 pandas==2.1.4
-pyarrow==15.0.2
-requests==2.32.3
-python-dateutil==2.9.0.post0
+numpy==1.26.4
 scipy==1.11.4
+requests==2.32.3
+pyarrow==14.0.2
+python-dateutil==2.9.0.post0
+nfl_data_py==0.3.3
