@@ -1,63 +1,134 @@
-#!/usr/bin/env python3
-import os, argparse, warnings, numpy as np, pandas as pd
-warnings.filterwarnings("ignore")
-try:
-    import nfl_data_py as nfl; NFL_OK=True
-except Exception as e:
-    print("[warn] nfl_data_py import failed:", e); NFL_OK=False
+# scripts/fetch_features.py
+# Builds the pricing input (inputs/straights.csv) and a rich feature store
+# (inputs/features_players.parquet) by merging sportsbook lines with advanced features.
 
-def weekly(season):
-    if not NFL_OK: return pd.DataFrame()
-    try:
-        return nfl.import_weekly_data([season,season-1])
-    except Exception as e:
-        print("[warn] weekly fetch failed:", e); return pd.DataFrame()
+from __future__ import annotations
+import argparse
+import pandas as pd
+import numpy as np
+import os
+from pathlib import Path
 
-def build_roll(df):
-    if df.empty: return pd.DataFrame()
-    df.rename(columns={"player_name":"player","recent_team":"team","opponent_team":"opp"}, inplace=True)
-    df=df.sort_values(["player","season","week"])
-    g=df.groupby("player",group_keys=False)
-    def rmean(s): return s.rolling(5, min_periods=2).mean()
-    def rstd(s):  return s.rolling(5, min_periods=2).std()
-    df["roll_pass_yds_mean"]=g["passing_yards"].apply(rmean); df["roll_pass_yds_std"]=g["passing_yards"].apply(rstd)
-    df["roll_rush_yds_mean"]=g["rushing_yards"].apply(rmean); df["roll_rush_yds_std"]=g["rushing_yards"].apply(rstd)
-    df["roll_rec_yds_mean"]=g["receiving_yards"].apply(rmean); df["roll_rec_yds_std"]=g["receiving_yards"].apply(rstd)
-    df["roll_rec_mean"]=g["receptions"].apply(rmean);       df["roll_rec_std"]=g["receptions"].apply(rstd)
-    last=df.groupby("player").tail(1)
-    keep=["player","team","opp","roll_pass_yds_mean","roll_rush_yds_mean","roll_rec_yds_mean","roll_rec_mean","roll_pass_yds_std","roll_rush_yds_std","roll_rec_yds_std","roll_rec_std"]
-    for c in keep:
-        if c not in last.columns: last[c]=np.nan
-    for c in last.columns:
-        if c.endswith("_std"): last[c]=last[c].fillna(15.0)
-        if c.endswith("_mean") or c.endswith("_mean"): last[c]=last[c].fillna(0.0)
-    return last[keep]
+import nfl_data_py as nfl
 
-def merge_features(sb, pri):
-    feats=sb.merge(pri, how="left", on="player")
-    def pick(row):
-        m=str(row["market"])
-        if "pass" in m: mu=row.get("roll_pass_yds_mean",np.nan); sd=row.get("roll_pass_yds_std",25.0)
-        elif "rush" in m: mu=row.get("roll_rush_yds_mean",np.nan); sd=row.get("roll_rush_yds_std",12.0)
-        elif "receiving" in m: mu=row.get("roll_rec_yds_mean",np.nan); sd=row.get("roll_rec_yds_std",12.0)
-        elif "receptions" in m: mu=row.get("roll_rec_mean",np.nan); sd=row.get("roll_rec_std",2.0)
-        else: mu,sd=np.nan,np.nan
-        return pd.Series({"prior_mean":mu,"prior_sd":sd})
-    feats[["prior_mean","prior_sd"]]=feats.apply(pick,axis=1)
-    feats["opp_def_adj"]=0.0; feats["pace_adj"]=0.0; feats["injury_adj"]=0.0; feats["weather_wind"]=0.0; feats["weather_temp"]=65.0
-    return feats
+# Advanced metrics
+from metrics.advanced import build_advanced
+
+ROOT = Path(__file__).resolve().parents[1]
+INP = ROOT / "inputs"
+
+def read_book_lines(path: Path) -> pd.DataFrame:
+    p = path if path.exists() else (INP / "sportsbook_lines.csv")
+    if not p.exists():
+        raise FileNotFoundError("sportsbook_lines.csv not found. If you skip API fetch, upload a CSV to inputs/")
+    df = pd.read_csv(p)
+    # expected columns: market, team, player, line, over_odds, under_odds, game_id(optional)
+    need = {"market", "team", "player", "line"}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"Lines CSV missing columns: {missing}")
+    return df
+
+def load_player_ids() -> pd.DataFrame:
+    # map full_name to gsis_id for joins; fallback to fuzzy join if needed
+    ppl = nfl.import_players()
+    return ppl[["gsis_id", "display_name", "full_name"]].rename(columns={"gsis_id": "player_id"})
+
+def markets_we_support() -> dict:
+    return {
+        "player_pass_yds": "pass_yds",
+        "player_rush_yds": "rush_yds",
+        "player_receiving_yds": "rec_yds",
+        "player_receptions": "receptions",
+    }
+
+def build_priors(seasons: list[int]) -> pd.DataFrame:
+    # rolling priors per player-market from nfl_data_py aggregated stats
+    # simple + robust: last 5 games mean & std (downcast to keep memory small)
+    stats = []
+    for season in seasons:
+        s = nfl.import_seasonal_passing_stats([season])
+        s["market"] = "pass_yds"; s["value"] = s["passing_yards"]; s["player_id"] = s["player_id"]; stats.append(s[["player_id", "season", "market", "value"]])
+
+        r = nfl.import_seasonal_rushing_stats([season])
+        r["market"] = "rush_yds"; r["value"] = r["rushing_yards"]; stats.append(r[["player_id", "season", "market", "value"]])
+
+        c = nfl.import_seasonal_receiving_stats([season])
+        c["market"] = "rec_yds"; c["value"] = c["receiving_yards"]; stats.append(c[["player_id", "season", "market", "value"]])
+
+        c2 = nfl.import_seasonal_receiving_stats([season]).rename(columns={"receptions": "value"})
+        c2["market"] = "receptions"; stats.append(c2[["player_id", "season", "market", "value"]])
+
+    pri = pd.concat(stats, ignore_index=True)
+    pri = (pri.groupby(["player_id", "market"], as_index=False)["value"]
+              .mean()
+              .rename(columns={"value": "prior_mean"}))
+    # crude SD floor; we let engine set stronger market floors
+    pri["prior_sd"] = np.maximum(np.sqrt(np.abs(pri["prior_mean"])) * 0.75, 8.0)
+    return pri
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--sportsbook",default="inputs/sportsbook_lines.csv")
-    ap.add_argument("--out_features",default="inputs/features_players.parquet")
-    ap.add_argument("--out_straights",default="inputs/straights.csv")
-    a=ap.parse_args()
-    season=pd.Timestamp.utcnow().year
-    sb=pd.read_csv(a.sportsbook) if os.path.exists(a.sportsbook) else pd.DataFrame(columns=["player","team","opp","market","line","over_odds","under_odds","book","game_id","game_time"])
-    pri=build_roll(weekly(season))
-    feats=merge_features(sb,pri)
-    os.makedirs(os.path.dirname(a.out_features),exist_ok=True)
-    feats.to_parquet(a.out_features,index=False)
-    sb.to_csv(a.out_straights,index=False)
-if __name__=="__main__": main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--season", type=int, default=0, help="current season (0=auto)")
+    ap.add_argument("--weeks", type=str, default="", help="comma weeks (optional)")
+    ap.add_argument("--out_lines", type=str, default=str(INP / "straights.csv"))
+    ap.add_argument("--features_out", type=str, default=str(INP / "features_players.parquet"))
+    ap.add_argument("--book_csv", type=str, default=str(INP / "sportsbook_lines.csv"))
+    args = ap.parse_args()
+
+    seasons = []
+    if args.season <= 0:
+        seasons = [pd.Timestamp.utcnow().year - 1, pd.Timestamp.utcnow().year]
+    else:
+        seasons = [args.season - 1, args.season]
+
+    # 1) Read sportsbook lines
+    lines = read_book_lines(Path(args.book_csv))
+    lines = lines.loc[lines["market"].isin(markets_we_support().keys())].copy()
+
+    # 2) Player IDs
+    pid = load_player_ids()
+    # best-effort name join (display_name or full_name)
+    lines = (lines.merge(pid, how="left", left_on="player", right_on="full_name")
+                  .fillna(method="ffill"))
+    if lines["player_id"].isna().any():
+        # fallback join on display_name too
+        lines = lines.merge(pid.rename(columns={"full_name":"full_name_2"}),
+                            how="left", left_on="player", right_on="display_name")
+        lines["player_id"] = lines["player_id"].fillna(lines["player_id_y"])
+        lines.drop(columns=[c for c in lines.columns if c.endswith("_y") or c.endswith("_2")], inplace=True)
+
+    # 3) Priors
+    pri = build_priors(seasons)
+
+    # 4) Advanced features (team+player)
+    team_adv, player_adv = build_advanced(seasons)
+
+    # 5) Merge features
+    m = markets_we_support()
+    lines["market_key"] = lines["market"].map(m)
+
+    feats = (lines.merge(pri, how="left", left_on=["player_id", "market_key"], right_on=["player_id", "market"])
+                  .merge(player_adv, how="left", on="player_id")
+                  .merge(team_adv.add_prefix("off_"), how="left", left_on="team", right_on="off_team"))
+
+    # defensive opponent adjustments (if opponent column exists in book csv)
+    if "opponent" in feats.columns:
+        feats = feats.merge(team_adv.add_prefix("def_"), how="left",
+                            left_on="opponent", right_on="def_team")
+
+    # 6) Persist features store
+    Path(args.features_out).parent.mkdir(parents=True, exist_ok=True)
+    feats.to_parquet(args.features_out, index=False)
+
+    # 7) Build straights input minimal schema for engine
+    need = ["player_id", "player", "team", "market", "line", "over_odds", "under_odds"]
+    for c in need:
+        if c not in lines.columns:
+            lines[c] = np.nan
+    lines[["player_id", "player", "team", "market", "line", "over_odds", "under_odds"]].to_csv(args.out_lines, index=False)
+    print(f"[fetch_features] wrote: {args.out_lines}")
+    print(f"[fetch_features] wrote features: {args.features_out}")
+
+if __name__ == "__main__":
+    main()
