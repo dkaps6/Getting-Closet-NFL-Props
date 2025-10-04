@@ -1,4 +1,4 @@
-name: Full Slate: Lines + Features + Model
+name: "Full Slate: Lines + Features + Model"
 
 on:
   workflow_dispatch:
