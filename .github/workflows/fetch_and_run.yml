@@ -1,24 +1,23 @@
-# .github/workflows/fetch_and_run.yml
-name: "Full Slate: Lines + Features + Model (defensive bootstrap)"
+name: Full Slate: Lines + Features + Model
 
 on:
   workflow_dispatch:
     inputs:
       refresh_lines:
-        description: "Pull sportsbook lines via Odds API (requires ODDS_API_KEY secret)"
+        description: "Fetch sportsbook lines (requires ODDS_API_KEY secret)"
         type: boolean
-        required: false
         default: false
+        required: false
       season:
-        description: "Season (e.g., 2025). Leave blank to auto-detect"
+        description: "Season (e.g. 2025); leave blank to auto-detect"
+        type: string
         required: false
         default: ""
-      weeks:
-        description: "Comma-separated weeks (e.g., 1,2,3). Leave blank to auto-detect"
+      week:
+        description: "Week number (e.g. 5); leave blank to auto-detect"
+        type: string
         required: false
         default: ""
-  push:
-    branches: ["main"]
 
 permissions:
   contents: read
@@ -34,61 +33,96 @@ jobs:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
 
     steps:
-      - name: "Checkout"
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: "Set up Python"
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: "Install dependencies"
+      - name: Install dependencies (with nfl_data_py compatibility)
         run: |
-          python -m pip install --upgrade pip wheel setuptools
-          pip install -r requirements.txt
+          set -e
+          python -m pip install -U pip setuptools wheel
+          # Try requirements.txt first (okay if you don't have one)
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || echo "requirements.txt install had conflicts; continuing..."
+          fi
+          # Ensure versions compatible with nfl_data_py
+          pip install "pandas<2.0" "numpy<2.0" nfl_data_py==0.3.3
+          # Common libs used elsewhere
+          pip install requests scipy pyarrow
 
-      # Optional: only runs if you checked 'refresh_lines' or if the secret is present.
-      - name: "Fetch sportsbook lines (optional)"
-        if: ${{ inputs.refresh_lines == true || env.ODDS_API_KEY != '' }}
+      - name: Prepare folders
+        run: |
+          mkdir -p inputs outputs
+
+      # Optional: download previously uploaded priors (won't fail if not present)
+      - name: Download priors (if available)
+        uses: actions/download-artifact@v4
+        with:
+          name: player_priors
+          path: inputs
+        continue-on-error: true
+
+      # ---------- OPTIONAL: Fetch sportsbook lines (needs ODDS_API_KEY) ----------
+      - name: Fetch sportsbook lines (optional)
+        if: ${{ inputs.refresh_lines == true && env.ODDS_API_KEY != '' }}
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-          python - <<'PY'
-          import os, subprocess, shlex
-          key = os.environ.get("ODDS_API_KEY", "")
-          if not key:
-              print("No ODDS_API_KEY secret; skipping sportsbook pulls.")
-              raise SystemExit(0)
-          season = "${{ inputs.season }}".strip()
-          weeks  = "${{ inputs.weeks }}".strip()
-          cmd = ["python","scripts/fetch_lines.py","--out","inputs/sportsbook_lines.csv"]
-          if season: cmd += ["--season", season]
-          if weeks:  cmd += ["--weeks",  weeks]
-          print("Running:", " ".join(shlex.quote(c) for c in cmd))
-          subprocess.check_call(cmd)
-          PY
+          set -e
+          echo "Fetching sportsbook lines with provided API key..."
+          # This expects scripts/fetch_lines.py in the repo
+          # and writes to inputs/sportsbook_lines.csv
+          python scripts/fetch_lines.py --out inputs/sportsbook_lines.csv || {
+            echo "::warning::Fetch lines failed (422 or API issue). Continuing without fresh lines."
+          }
+          ls -lh inputs || true
 
-      - name: "Fetch features (nflverse + NWS)"
+      # ---------- REQUIRED: Fetch features with explicit --out ----------
+      - name: Fetch features (nflverse + NWS)
+        env:
+          SEASON: ${{ inputs.season }}
+          WEEK:   ${{ inputs.week }}
         run: |
           set -e
-          F=fetch_features.py
-          if [ -f scripts/fetch_features.py ]; then F=scripts/fetch_features.py; fi
-          # These args are placeholders; the script can ignore blanks
-          python "$F" \
-            --game_id "" \
-            --home_team "" \
-            --away_team "" \
-            --lat "" \
-            --lon ""
+          # scripts/fetch_features.py must exist in your repo.
+          # It requires --out; season/week are optional and only passed when non-empty.
+          python scripts/fetch_features.py \
+            --out inputs/features.csv \
+            ${SEASON:+--season "$SEASON"} \
+            ${WEEK:+--week "$WEEK"}
 
-      - name: "Run model"
-        run: python run_model.py
+          echo "Wrote features to inputs/features.csv"
+          head -n 5 inputs/features.csv || true
 
-      - name: "Upload artifacts"
+      # ---------- Run your model ----------
+      - name: Run model
+        run: |
+          set -e
+          # Make sure your run_model.py reads inputs/features.csv and (optionally)
+          # inputs/sportsbook_lines.csv, then writes results to outputs/
+          python run_model.py
+          echo "Model finished. Outputs:"
+          ls -lh outputs || true
+
+      # ---------- Upload artifacts ----------
+      - name: Upload outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: model_outputs
+          name: outputs
+          path: outputs
+          if-no-files-found: warn
+
+      - name: Upload inputs used (for traceability)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inputs
           path: |
-            outputs/**
+            inputs/features.csv
             inputs/sportsbook_lines.csv
           if-no-files-found: warn
