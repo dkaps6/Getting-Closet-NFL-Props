@@ -1,7 +1,9 @@
-pandas==2.1.4
-numpy==1.26.4
+# Requirements pinned to be compatible with nfl_data_py 0.3.3
+pandas==1.5.3
+numpy==1.24.4
 scipy==1.11.4
 requests==2.32.3
 pyarrow==14.0.2
 python-dateutil==2.9.0.post0
 nfl_data_py==0.3.3
+tzdata==2024.1
