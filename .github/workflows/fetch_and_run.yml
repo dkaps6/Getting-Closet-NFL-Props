@@ -1,20 +1,7 @@
-name: "Full Slate: Lines + Features + Model"
+name: Full Slate: Lines + Features + Model
 
 on:
   workflow_dispatch:
-    inputs:
-      refresh_lines:
-        description: "Fetch sportsbook lines (requires ODDS_API_KEY secret)"
-        required: false
-        default: "false"
-      season:
-        description: "Season (e.g., 2025); leave blank to auto-detect"
-        required: false
-        default: ""
-      week:
-        description: "Week number (e.g., 5); leave blank to auto-detect"
-        required: false
-        default: ""
 
 permissions:
   contents: read
@@ -26,10 +13,6 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      # If present, enables optional sportsbook fetch
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,83 +20,40 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies (safe set for nfl_data_py)
+      - name: Install dependencies
         run: |
-          set -e
-          python -m pip install -U pip setuptools wheel
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt || echo "requirements.txt had conflicts; continuing with pinned set..."
-          fi
-          pip install "pandas<2.0" "numpy<2.0" nfl_data_py==0.3.3
-          pip install requests scipy pyarrow
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Prepare folders
-        run: |
-          mkdir -p inputs outputs
-
-      - name: Download priors (if available)
-        uses: actions/download-artifact@v4
-        with:
-          name: player_priors
-          path: inputs
-        continue-on-error: true
-
-      # ---------- OPTIONAL: Sportsbook lines fetch ----------
-      - name: Fetch sportsbook lines (optional)
-        if: ${{ github.event.inputs.refresh_lines == 'true' && env.ODDS_API_KEY != '' }}
+      # REQUIRED: pulls lines from The Odds API (needs repo secret ODDS_API_KEY)
+      - name: Fetch sportsbook lines via The Odds API
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-          set -e
-          echo "Fetching sportsbook lines..."
-          python scripts/fetch_lines.py --out inputs/sportsbook_lines.csv || {
-            echo "::warning::Fetch lines failed (likely 422 or quota); continuing without fresh lines."
-          }
-          ls -lh inputs || true
+          python scripts/fetch_lines.py --out inputs/sportsbook_lines.csv
 
-      # ---------- REQUIRED: Features fetch with explicit --out ----------
-      - name: Fetch features (nflverse + NWS)
-        env:
-          SEASON: ${{ github.event.inputs.season }}
-          WEEK:   ${{ github.event.inputs.week }}
+      # Optional: previously saved priors as artifact
+      - name: Download priors (if available)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: player_priors
+          path: inputs/
+
+      # Optional: feature fetch; never aborts the job if it fails
+      - name: Fetch features (nflverse + NWS) (optional)
+        continue-on-error: true
         run: |
-          set -e
-          # Required: scripts/fetch_features.py in your repo
-          # It must accept --out; season/week are optional.
-          python scripts/fetch_features.py \
-            --out inputs/features.csv \
-            ${SEASON:+--season "$SEASON"} \
-            ${WEEK:+--week "$WEEK"}
+          python scripts/fetch_features.py --out inputs/features.parquet || echo "Skipping features (optional)"
 
-          echo "Features ready at inputs/features.csv"
-          head -n 5 inputs/features.csv || true
-
-      # ---------- Run your model ----------
       - name: Run model
         run: |
-          set -e
-          # run_model.py should read from inputs/ and write to outputs/
-          python run_model.py
-          echo "Model finished."
-          ls -lh outputs || true
+          python scripts/run_model.py
 
-      # ---------- Upload artifacts ----------
       - name: Upload outputs
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: outputs
-          path: outputs
-          if-no-files-found: warn
-
-      - name: Upload inputs used
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: inputs
-          path: |
-            inputs/features.csv
-            inputs/sportsbook_lines.csv
-          if-no-files-found: warn
+          name: model_outputs
+          path: outputs/
