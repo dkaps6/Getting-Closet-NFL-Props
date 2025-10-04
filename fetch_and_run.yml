@@ -1,0 +1,36 @@
+name: Full Slate: Lines + Features + Model
+on: { workflow_dispatch: {} }
+permissions: { contents: read }
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Fetch sportsbook lines (optional)
+        continue-on-error: true
+        run: |
+          if [ -n "${ODDS_API_KEY}" ]; then
+            python scripts/fetch_lines.py --out inputs/sportsbook_lines.csv
+          else
+            mkdir -p inputs
+            echo "player,team,opp,market,line,over_odds,under_odds,book,game_id,game_time" > inputs/sportsbook_lines.csv
+          fi
+      - name: Build features
+        run: |
+          python scripts/fetch_features.py --sportsbook inputs/sportsbook_lines.csv --out_features inputs/features_players.parquet --out_straights inputs/straights.csv
+      - name: Run model
+        run: python run_model.py
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-outputs
+          path: outputs/*.csv
