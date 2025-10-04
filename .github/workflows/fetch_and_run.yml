@@ -1,9 +1,24 @@
-name: Full Slate: Lines + Features + Model (defensive bootstrap)
+# .github/workflows/fetch_and_run.yml
+name: "Full Slate: Lines + Features + Model (defensive bootstrap)"
 
 on:
   workflow_dispatch:
+    inputs:
+      refresh_lines:
+        description: "Pull sportsbook lines via Odds API (requires ODDS_API_KEY secret)"
+        type: boolean
+        required: false
+        default: false
+      season:
+        description: "Season (e.g., 2025). Leave blank to auto-detect"
+        required: false
+        default: ""
+      weeks:
+        description: "Comma-separated weeks (e.g., 1,2,3). Leave blank to auto-detect"
+        required: false
+        default: ""
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: read
@@ -15,89 +30,65 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     env:
-      # If you add this in repo Settings ▸ Secrets and variables ▸ Actions
-      # the workflow will pick it up automatically
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
 
     steps:
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: Ensure standard folders
-        run: |
-          set -euxo pipefail
-          mkdir -p inputs outputs scripts .github/workflows
-          # Keep folders in git
-          touch inputs/.gitkeep outputs/.gitkeep
-
-      - name: Set up Python 3.11
+      - name: "Set up Python"
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: "Install dependencies"
         run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            # Fallback (shouldn't hit, but keeps run green)
-            pip install numpy==1.26.4 pandas==2.1.4 pyarrow==15.0.2 requests==2.32.3
-          fi
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements.txt
 
-      - name: Show environment
-        run: |
-          python -V
-          pip --version
-          pip freeze | sort | sed -n '1,120p'
-
-      # --- Sanity: never fail the build below this line ---
-      - name: Sanity – make sure Python can import pandas/numpy
+      # Optional: only runs if you checked 'refresh_lines' or if the secret is present.
+      - name: "Fetch sportsbook lines (optional)"
+        if: ${{ inputs.refresh_lines == true || env.ODDS_API_KEY != '' }}
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
-          import sys, numpy as np, pandas as pd
-          print("NumPy:", np.__version__)
-          print("pandas:", pd.__version__)
-          print("Python:", sys.version)
+          import os, subprocess, shlex
+          key = os.environ.get("ODDS_API_KEY", "")
+          if not key:
+              print("No ODDS_API_KEY secret; skipping sportsbook pulls.")
+              raise SystemExit(0)
+          season = "${{ inputs.season }}".strip()
+          weeks  = "${{ inputs.weeks }}".strip()
+          cmd = ["python","scripts/fetch_lines.py","--out","inputs/sportsbook_lines.csv"]
+          if season: cmd += ["--season", season]
+          if weeks:  cmd += ["--weeks",  weeks]
+          print("Running:", " ".join(shlex.quote(c) for c in cmd))
+          subprocess.check_call(cmd)
           PY
 
-      # Make these scripts optional. If missing, we just log and move on.
-      - name: Run advanced.py (optional)
-        continue-on-error: true
+      - name: "Fetch features (nflverse + NWS)"
         run: |
-          set -euxo pipefail
-          if [ -f scripts/advanced.py ]; then
-            python scripts/advanced.py --dry-run
-          else
-            echo "scripts/advanced.py not found (ok while bootstrapping)."
-          fi
+          set -e
+          F=fetch_features.py
+          if [ -f scripts/fetch_features.py ]; then F=scripts/fetch_features.py; fi
+          # These args are placeholders; the script can ignore blanks
+          python "$F" \
+            --game_id "" \
+            --home_team "" \
+            --away_team "" \
+            --lat "" \
+            --lon ""
 
-      - name: Run fetch_features.py (optional)
-        continue-on-error: true
-        run: |
-          set -euxo pipefail
-          if [ -f scripts/fetch_features.py ]; then
-            python scripts/fetch_features.py || true
-          else
-            echo "scripts/fetch_features.py not found (ok while bootstrapping)."
-          fi
+      - name: "Run model"
+        run: python run_model.py
 
-      - name: Run engine.py (optional)
-        continue-on-error: true
-        run: |
-          set -euxo pipefail
-          if [ -f scripts/engine.py ]; then
-            python scripts/engine.py || true
-          else
-            echo "scripts/engine.py not found (ok while bootstrapping)."
-          fi
-
-      - name: Upload outputs (if any)
+      - name: "Upload artifacts"
         uses: actions/upload-artifact@v4
         with:
-          name: model-outputs
-          path: outputs/
-          if-no-files-found: ignore
+          name: model_outputs
+          path: |
+            outputs/**
+            inputs/sportsbook_lines.csv
+          if-no-files-found: warn
