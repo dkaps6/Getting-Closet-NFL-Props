@@ -1,74 +1,199 @@
-import numpy as np, pandas as pd
+# engine.py
+# Prices props using priors + advanced adjustments + Kelly + ladders.
+
+from __future__ import annotations
+import pandas as pd
+import numpy as np
+from pathlib import Path
 from scipy.stats import norm
 
-CONFIG={
-  "kelly_cap":0.05,
-  "edge_threshold":0.02,
-  "sd_min":{"player_pass_yds":25.0,"player_rush_yds":12.0,"player_receiving_yds":12.0,"player_receptions":2.0},
-  "ladder":{"player_pass_yds":[-25,0,25,50,75],"player_rush_yds":[-10,0,10,20,30],"player_receiving_yds":[-10,0,10,20,30],"player_receptions":[-2,0,1,2,3]},
-  "coeff":{"opp_def_adj":-0.15,"pace_adj":0.10,"injury_adj":-0.20,"wind":-0.06}
+ROOT = Path(__file__).resolve().parent
+INP = ROOT / "inputs"
+OUT = ROOT / "outputs"
+
+CONFIG = {
+    "n_sims": 20000,
+    "kelly_cap": 0.05,        # maximum Kelly fraction
+    "min_edge": 0.01,         # require at least 1% edge
+    "market_sd_floor": {      # conservative distribution floors (units of stat)
+        "pass_yds": 18.0,
+        "rush_yds": 12.0,
+        "rec_yds": 12.0,
+        "receptions": 1.25,
+    },
+    "usage_weight": 0.35,     # strength of usage (share) adjustments
+    "pace_weight": 0.20,      # strength of neutral pace / PROE adjustments
+    "def_weight": 0.30,       # strength of opponent EPA-based adjustments
 }
 
-def prob_to_american(p):
-    if p<=0 or p>=1: return np.nan
-    return -int(round(100*p/(1-p))) if p>0.5 else int(round(100*(1-p)/p))
+MARKET_ALIASES = {
+    "player_pass_yds": "pass_yds",
+    "player_rush_yds": "rush_yds",
+    "player_receiving_yds": "rec_yds",
+    "player_receptions": "receptions",
+}
 
-def kelly(p, b, cap=0.05):
-    q=1-p
-    return float(np.clip((p*b - q)/b if b>0 else 0.0, 0.0, cap))
+def _safe(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
 
-def dec(american):
-    if not np.isfinite(american): return np.nan
-    a=float(american); return 1 + (a/100.0 if a>0 else 100.0/(-a))
+def _kelly_fraction(p_true: float, price: float, cap: float) -> float:
+    # price is American odds; convert to decimal and do Kelly on EV
+    # If price is NaN, return 0
+    if np.isnan(price):
+        return 0.0
+    if price > 0:
+        dec = 1 + price / 100.0
+    else:
+        dec = 1 + 100.0 / abs(price)
 
-def project_mean(r):
-    mu=r.get("prior_mean",np.nan)
-    if not np.isfinite(mu): mu=r.get("line",0.0)
-    adj=0.0; c=CONFIG["coeff"]; m=str(r.get("market",""))
-    adj+=c["opp_def_adj"]*(r.get("opp_def_adj",0.0) or 0.0)
-    adj+=c["pace_adj"]*(r.get("pace_adj",0.0) or 0.0)
-    adj+=c["injury_adj"]*(r.get("injury_adj",0.0) or 0.0)
-    if "pass" in m or "receiv" in m or "reception" in m:
-        adj+=c["wind"]*((r.get("weather_wind",0.0) or 0.0)/20.0)
-    return float(mu*(1+adj))
+    b = dec - 1.0
+    q = 1 - p_true
+    k = (b * p_true - q) / b
+    return max(0.0, min(cap, k))
 
-def project_sd(r):
-    m=str(r.get("market","")); sd=r.get("prior_sd",np.nan)
-    return float(max(sd if np.isfinite(sd) else 0.0, CONFIG["sd_min"].get(m,10.0)))
+def _implied_p(american: float) -> float:
+    if np.isnan(american):
+        return np.nan
+    return (100.0 / (american + 100.0)) if american > 0 else (abs(american) / (abs(american) + 100.0))
 
-def price_row(row):
-    line=row.get("line",np.nan); 
-    if not np.isfinite(line): return None
-    mu=project_mean(row); sd=project_sd(row)
-    p_over=1.0 - norm.cdf((line-mu)/sd); p_under=1-p_over
-    do=dec(row.get("over_odds",np.nan)); du=dec(row.get("under_odds",np.nan))
-    edge_over= p_over - (1/do if np.isfinite(do) else np.nan)
-    edge_under= p_under - (1/du if np.isfinite(du) else np.nan)
-    bo="over" if (edge_over if np.isfinite(edge_over) else -1) > (edge_under if np.isfinite(edge_under) else -1) else "under"
-    b = (do-1) if bo=="over" else (du-1)
-    k = kelly(p_over if bo=="over" else p_under, b, CONFIG["kelly_cap"]) if np.isfinite(b) else 0.0
-    return {"proj_mean":mu,"proj_sd":sd,"p_over":p_over,"p_under":p_under,"edge_over":edge_over,"edge_under":edge_under,"best_side":bo,"best_edge":edge_over if bo=='over' else edge_under,"kelly":k,"fair_over":prob_to_american(p_over),"fair_under":prob_to_american(p_under)}
+def _adj_mean(row: pd.Series) -> float:
+    mean = _safe(row.get("prior_mean"), 0.0)
+    mk = row["market_key"]
 
-def synth_ladder(row, steps):
-    mu=project_mean(row); sd=project_sd(row); m=str(row.get("market",""))
-    out=[]
-    for d in steps:
-        line=(row.get("line",0.0) or 0.0)+float(d)
-        p=1.0 - norm.cdf((line-mu)/sd)
-        out.append({"player":row.get("player",""),"team":row.get("team",""),"opp":row.get("opp",""),"market":m,"target_line":line,"model_prob_over":p,"model_fair_american":prob_to_american(p),"game_id":row.get("game_id",""),"book":row.get("book","")})
-    return out
+    # Usage (receiving: target share & aDOT; rushing: rush/inside-5 share)
+    usage_mult = 1.0
+    if mk in ["rec_yds", "receptions"]:
+        ts = _safe(row.get("target_share_l5"), 0.0)
+        adot = _safe(row.get("adot_l5"), 0.0)
+        usage_mult *= (1.0 + CONFIG["usage_weight"] * (ts - 0.18))  # 18% ~ avg primary receiver
+        usage_mult *= (1.0 + 0.10 * (adot - 8.0) / 8.0)            # nudges if aDOT well above/below avg
+    elif mk == "rush_yds":
+        rs = _safe(row.get("rush_share_l5"), 0.0)
+        i5 = _safe(row.get("i5_share_l5"), 0.0)
+        usage_mult *= (1.0 + CONFIG["usage_weight"] * (rs - 0.55))  # lead back ~55% share baseline
+        usage_mult *= (1.0 + 0.05 * (i5 - 0.35))                     # goal-line share tiny nudge
+    elif mk == "pass_yds":
+        # a bit of boost if offense PROE is high
+        pass
 
-def price_straights(lines: pd.DataFrame):
-    rows=[]; ladders=[]
-    for _,r in lines.iterrows():
-        pr=price_row(r.to_dict()); 
-        if pr is None: continue
-        rec={**r.to_dict(),**pr}; rows.append(rec)
-        steps=CONFIG["ladder"].get(str(r.get("market","")),[0])
-        ladders+=synth_ladder(r, steps)
-    s=pd.DataFrame(rows); l=pd.DataFrame(ladders)
-    if not s.empty:
-        s=s[s["best_edge"].fillna(-1)>=CONFIG["edge_threshold"]].copy()
-        s.sort_values(["best_edge","kelly"],ascending=[False,False],inplace=True)
-    if not l.empty: l.sort_values(["player","market","target_line"],inplace=True)
-    return s,l
+    # Pace & PROE
+    pace_mult = 1.0
+    proe = _safe(row.get("off_proe"), 0.0)
+    neutral_idx = _safe(row.get("off_neutral_plays_per_game_idx"), 1.0)
+    pace_mult *= (1.0 + CONFIG["pace_weight"] * proe)        # +/- from expected pass tendency
+    pace_mult *= neutral_idx ** 0.25                         # gentle pace scaling
+
+    # Opponent defense
+    def_adj = 1.0
+    opp_def = None
+    if mk in ["pass_yds", "rec_yds", "receptions"]:
+        opp_def = -_safe(row.get("def_def_epa_allowed"))  # negative EPA allowed = tough defense
+    elif mk == "rush_yds":
+        opp_def = -_safe(row.get("def_def_epa_allowed"))
+    if opp_def is not None:
+        def_adj *= (1.0 + CONFIG["def_weight"] * opp_def)
+
+    mean *= usage_mult * pace_mult * def_adj
+    return max(0.0, mean)
+
+def _adj_sd(row: pd.Series) -> float:
+    mk = row["market_key"]
+    sd = _safe(row.get("prior_sd"), CONFIG["market_sd_floor"].get(mk, 10.0))
+    return float(max(CONFIG["market_sd_floor"].get(mk, 10.0), sd))
+
+def _ladder_targets(mk: str, line: float) -> list[float]:
+    if mk in ["rec_yds", "rush_yds", "pass_yds"]:
+        step = 15.0 if mk != "pass_yds" else 25.0
+    else:
+        step = 1.0
+    return [line + i * step for i in (1, 2, 3)]
+
+def price_row(row: pd.Series) -> dict:
+    mk = row["market_key"]
+    line = _safe(row.get("line"), 0.0)
+    mean = _adj_mean(row)
+    sd = _adj_sd(row)
+
+    # Over/Under probabilities from normal
+    p_over = 1.0 - norm.cdf((line - mean) / sd)
+    p_under = 1.0 - p_over
+
+    # Kelly suggestions
+    k_over = _kelly_fraction(p_over, _safe(row.get("over_odds"), np.nan), CONFIG["kelly_cap"])
+    k_under = _kelly_fraction(p_under, _safe(row.get("under_odds"), np.nan), CONFIG["kelly_cap"])
+
+    edge_over = p_over - _implied_p(_safe(row.get("over_odds"), np.nan))
+    edge_under = p_under - _implied_p(_safe(row.get("under_odds"), np.nan))
+
+    best_side = "over" if edge_over >= edge_under else "under"
+    best_edge = max(edge_over, edge_under)
+
+    return {
+        "model_mean": mean,
+        "model_sd": sd,
+        "p_over": p_over,
+        "p_under": p_under,
+        "kelly_over": k_over if edge_over >= CONFIG["min_edge"] else 0.0,
+        "kelly_under": k_under if edge_under >= CONFIG["min_edge"] else 0.0,
+        "best_side": best_side if best_edge >= CONFIG["min_edge"] else "pass",
+        "best_edge": float(max(0.0, best_edge)),
+    }
+
+def simulate_ladders(row: pd.Series) -> list[dict]:
+    mk = row["market_key"]
+    mean = _safe(row.get("model_mean"), 0.0)
+    sd = _safe(row.get("model_sd"), 10.0)
+    if sd <= 0:
+        return []
+
+    ladders = []
+    for tgt in _ladder_targets(mk, _safe(row.get("line"), 0.0)):
+        p_over = 1.0 - norm.cdf((tgt - mean) / sd)
+        ladders.append({"alt_line": tgt, "p_over": p_over})
+    return ladders
+
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    feats_path = INP / "features_players.parquet"
+    lines_path = INP / "straights.csv"
+
+    if not feats_path.exists():
+        print("[engine] features store not found; run fetch_features first.")
+        return
+    features = pd.read_parquet(feats_path)
+
+    # Map market -> key used in priors
+    features["market_key"] = features["market"].map(MARKET_ALIASES)
+    features = features.dropna(subset=["market_key", "line"]).copy()
+
+    # Price straights
+    priced = features.apply(price_row, axis=1, result_type="expand")
+    out = pd.concat([features.reset_index(drop=True), priced], axis=1)
+
+    cols = [
+        "player", "team", "market", "line", "over_odds", "under_odds",
+        "model_mean", "model_sd", "p_over", "p_under",
+        "kelly_over", "kelly_under", "best_side", "best_edge"
+    ]
+    out[cols].sort_values("best_edge", ascending=False).to_csv(OUT / "props_straights.csv", index=False)
+
+    # Ladders
+    ladd = out.apply(simulate_ladders, axis=1)
+    ladd_df = []
+    for i, xs in enumerate(ladd):
+        if not xs:
+            continue
+        base = out.loc[i, ["player", "team", "market", "line", "model_mean", "model_sd"]].to_dict()
+        for row in xs:
+            ladd_df.append(base | row)
+    ladd_df = pd.DataFrame(ladd_df)
+    if not ladd_df.empty:
+        ladd_df.sort_values(["market", "p_over"], ascending=[True, False]).to_csv(OUT / "props_ladders.csv", index=False)
+
+    print("[engine] wrote outputs/props_straights.csv and outputs/props_ladders.csv")
+
+if __name__ == "__main__":
+    main()
